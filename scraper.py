@@ -284,31 +284,10 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
 
             cal.add_component(ev_brief)
             briefings_count += 1
-
-    # Add a live test alert for verification (5 minutes from now)
-    now_kolkata = datetime.datetime.now(TZ_KOLKATA)
-    t_start = now_kolkata + datetime.timedelta(minutes=5)
-    t_end = t_start + datetime.timedelta(minutes=30)
-    ev_test = Event()
-    ev_test.add("summary", "🔔 Alert Test: INT108 in Room 34-702A")
-    ev_test.add("location", "Room 34-702A, LPU")
-    ev_test.add("description", "Testing class notifications on your iPhone.")
-    ev_test.add("dtstart", t_start)
-    ev_test.add("dtend", t_end)
-    ev_test.add("dtstamp", now_utc)
-    ev_test.add("uid", f"lpu-live-test-{now_kolkata.strftime('%Y%m%d%H%M%S')}@lpu-sync")
-
-    alarm_test = Alarm()
-    alarm_test.add("action", "DISPLAY")
-    alarm_test.add("description", "🔔 Class in 10 mins: INT108 in Room 34-702A")
-    alarm_test.add("trigger", datetime.timedelta(minutes=-4)) # Alert in ~1-2 minutes
-    ev_test.add_component(alarm_test)
-    cal.add_component(ev_test)
-
     with open(output_path, "wb") as f:
         f.write(cal.to_ical())
 
-    print(f"[+] Successfully wrote {events_count} class events (with 10-min alerts), {briefings_count} daily morning summary briefings, and 1 live test alert to {output_path}")
+    print(f"[+] Successfully wrote {events_count} class events (with 10-min alerts) and {briefings_count} daily morning summary briefings to {output_path}")
     return True
 
 def push_to_github():
