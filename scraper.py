@@ -41,7 +41,7 @@ COURSES = {
 
 def parse_slot(slot_str):
     """
-    Parses a time slot string like '09:00-10:00 AM' or '01:00-02:00 PM' or '11:00-12:00 PM'.
+    Parses a time slot string like '09:20-10:10 AM' or '01:30-02:20 PM' or '11:50-12:40 AM'.
     Returns (start_hour, start_min, end_hour, end_min) in 24-hour format.
     """
     clean_str = slot_str.strip().replace("  ", " ")
@@ -59,12 +59,30 @@ def parse_slot(slot_str):
         if eh != 12:
             eh += 12
     elif med == "AM":
-        if sh == 12:
+        # Handle UMS bug like 11:50-12:40 AM where 12:40 is actually 12:40 PM noon
+        if sh == 11 and eh == 12:
+            eh = 12
+        elif sh == 12:
             sh = 0
-        if eh == 12:
-            eh = 0
+        elif eh == 12:
+            eh = 12
 
     return sh, sm, eh, em
+
+def extract_course_titles(soup):
+    """
+    Automatically extracts course code to course title mapping from table in UMS HTML.
+    """
+    course_map = {}
+    for tr in soup.find_all("tr"):
+        tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+        for idx, text in enumerate(tds):
+            if re.match(r"^[A-Z]{2,4}\d{3}[A-Z]?$", text.strip()):
+                code = text.strip()
+                if len(tds) > idx + 2:
+                    title = tds[idx + 2].title()
+                    course_map[code] = title
+    return course_map
 
 def get_html(headed=False):
     """
@@ -144,7 +162,6 @@ def get_html(headed=False):
                         print(f"[+] Login detected! Redirected to: {page.url}")
                         logged_in = True
                         break
-                    # If still on login page and login button is visible, try auto-click if turnstile cleared
                     token = page.locator("[name*='cf-turnstile-response']").first.input_value() if page.locator("[name*='cf-turnstile-response']").count() > 0 else ""
                     if token and len(token) > 20:
                         btn = page.locator('input[name*="btnSubmit"], input[value="Login"]').first
@@ -155,7 +172,6 @@ def get_html(headed=False):
                 if not logged_in and "loginnew.aspx" in page.url.lower():
                     print("[-] Timed out waiting for login. Continuing attempt to navigate to report...")
             else:
-                # Headless automated flow
                 for f in page.frames:
                     if "challenges.cloudflare.com" in f.url or "turnstile" in f.url:
                         try:
@@ -172,7 +188,6 @@ def get_html(headed=False):
                     submit_loc.click()
                     page.wait_for_timeout(3000)
 
-            # Navigate directly to Student Timetable Report
             print("[*] Opening Student Timetable Report (frmStudentTimeTable.aspx)...")
             page.goto("https://ums.lpu.in/lpuums/Reports/frmStudentTimeTable.aspx", wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)
@@ -194,7 +209,6 @@ def get_html(headed=False):
                 except Exception:
                     pass
 
-            # Save local HTML copy as backup
             with open("timetable.html", "w", encoding="utf-8") as f:
                 f.write(content)
             print("[+] Saved raw timetable backup to timetable.html")
@@ -217,9 +231,13 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
     Generates rolling events for `num_weeks` starting from the target Monday.
     """
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table", class_=lambda c: c and "139" in c)
+    
+    # Auto-extract course titles from HTML
+    course_titles = extract_course_titles(soup)
+    merged_courses = {**COURSES, **course_titles}
+
+    table = soup.find("table", class_=lambda c: c and any("139" in x for x in (c if isinstance(c, list) else [c])))
     if not table:
-        # Fallback: search for any table containing time slots
         for tbl in soup.find_all("table"):
             if tbl.find(string=re.compile(r"\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}")):
                 table = tbl
@@ -257,17 +275,25 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
         if len(tds) < 6:
             continue
 
-        times = parse_slot(tds[0])
-        if not times:
+        # Dynamically find the column containing the time slot
+        timing_col = None
+        times = None
+        for idx, text in enumerate(tds):
+            parsed = parse_slot(text)
+            if parsed:
+                timing_col = idx
+                times = parsed
+                break
+
+        if timing_col is None or not times:
             continue
         sh, sm, eh, em = times
 
-        # Loop through Monday to Friday (indices 0 to 4 correspond to tds[1] to tds[5])
-        # Also include Saturday (tds[6]) if available in row
-        max_days = min(len(tds) - 1, 6)
+        # Loop through Monday to Friday (and Saturday if present)
+        max_days = min(len(tds) - 1 - timing_col, 6)
 
         for day_idx in range(max_days):
-            val = tds[day_idx + 1].strip()
+            val = tds[timing_col + 1 + day_idx].strip()
             if not val or val == "\xa0" or "Project Work" in val or "Other Weekly Activities" in val:
                 continue
 
@@ -280,7 +306,7 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
             room = r_m.group(1) if r_m else "LPU Campus"
             section = s_m.group(1) if s_m else "N/A"
             group = g_m.group(1) if g_m else "N/A"
-            title = COURSES.get(code, code)
+            title = merged_courses.get(code, code)
 
             type_char = val.split()[0].upper() if val else ""
             type_name = "Class"
@@ -330,10 +356,9 @@ def push_to_github():
     try:
         print("[*] Pushing updated timetable.ics to GitHub...")
         subprocess.run(["git", "add", "timetable.ics"], check=True)
-        # Check if there are staged changes
         res = subprocess.run(["git", "diff", "--staged", "--quiet"])
         if res.returncode != 0:
-            subprocess.run(["git", "commit", "-m", "Sync timetable.ics from local run"], check=True)
+            subprocess.run(["git", "commit", "-m", "Sync real timetable.ics with all class events"], check=True)
             subprocess.run(["git", "push", "origin", "main"], check=True)
             print("[+] Successfully pushed updated timetable to GitHub Pages!")
         else:
