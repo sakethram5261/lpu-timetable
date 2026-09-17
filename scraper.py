@@ -69,11 +69,14 @@ def get_html():
     Automates login to LPU UMS and extracts the student timetable HTML using Playwright.
     """
     if not REG_ID or not PASSWORD:
-        raise ValueError("LPU_REG_ID and LPU_PASSWORD environment variables must be set.")
+        print("[!] ERROR: LPU_REG_ID or LPU_PASSWORD environment variable is missing!")
+        print("[!] Please configure LPU_REG_ID and LPU_PASSWORD in your GitHub Repository Secrets:")
+        print("[!] Settings -> Secrets and variables -> Actions -> New repository secret")
+        sys.exit(1)
 
     from playwright.sync_api import sync_playwright
 
-    print(f"[*] Launching Playwright browser for user: {REG_ID}...")
+    print(f"[*] Launching Playwright browser for user ID: {REG_ID}...")
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -88,12 +91,11 @@ def get_html():
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800}
         )
-        # Avoid webdriver automation flags
+        # Prevent automation flag detection
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         page = context.new_page()
 
-        # Try to apply stealth if library is installed
         try:
             from playwright_stealth import Stealth
             stealth = Stealth()
@@ -101,70 +103,91 @@ def get_html():
         except Exception:
             pass
 
-        # Dismiss any popup dialogs automatically
         page.on("dialog", lambda dialog: dialog.accept())
 
-        print("[*] Navigating to UMS Login...")
-        page.goto("https://ums.lpu.in/lpuums/LoginNew.aspx", wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2000)
-
-        # Flexible selector matching for username
-        user_loc = page.locator('input[name*="txtUserName"], #txtU, input[type="text"]').first
-        user_loc.fill(REG_ID)
-
-        # Flexible selector matching for password
-        pwd_loc = page.locator('input[name*="txtPassword"], input[type="password"]').first
-        pwd_loc.fill(PASSWORD)
-
-        # Check for Cloudflare Turnstile challenge if present
-        for f in page.frames:
-            if "challenges.cloudflare.com" in f.url or "turnstile" in f.url:
-                print("[*] Detected Cloudflare Turnstile, attempting solve...")
-                try:
-                    frame_el = f.frame_element()
-                    box = frame_el.bounding_box()
-                    if box:
-                        page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
-                        page.wait_for_timeout(3000)
-                except Exception as e:
-                    print(f"[-] Turnstile interaction note: {e}")
-                break
-
-        print("[*] Clicking Login button...")
-        submit_loc = page.locator('input[name*="btnSubmit"], input[value="Login"], input[type="submit"]').first
-        submit_loc.click()
-
-        # Wait for post-login navigation or dashboard
         try:
-            page.wait_for_load_state("domcontentloaded", timeout=45000)
-        except Exception:
-            pass
-        page.wait_for_timeout(2000)
+            print("[*] Navigating to UMS Login page...")
+            page.goto("https://ums.lpu.in/lpuums/LoginNew.aspx", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2000)
+            print(f"[*] Loaded URL: {page.url} | Title: {page.title()}")
 
-        print("[*] Navigating to Student Timetable Report...")
-        page.goto("https://ums.lpu.in/lpuums/Reports/frmStudentTimeTable.aspx", wait_until="domcontentloaded", timeout=60000)
+            # Check if username input exists
+            user_loc = page.locator('input[name*="txtUserName"], #txtU, input[type="text"]').first
+            if not user_loc.is_visible():
+                print("[!] Username input not visible! Page might be under Cloudflare interstitial.")
+                page.screenshot(path="debug_error.png")
+                content = page.content()
+                browser.close()
+                return content
 
-        # Wait for the timetable grid table matching class containing '139'
-        print("[*] Waiting for timetable grid table...")
-        try:
-            page.wait_for_selector('table[class*="139"]', timeout=45000)
-        except Exception:
-            print("[-] Selector table[class*='139'] not found directly, checking fallback...")
+            print("[*] Entering username...")
+            user_loc.fill(REG_ID)
 
-        content = page.content()
+            # Check if password input exists
+            pwd_loc = page.locator('input[name*="txtPassword"], input[type="password"]').first
+            print("[*] Entering password...")
+            pwd_loc.fill(PASSWORD)
 
-        # Check all child frames if present (e.g. ReportViewer iframe)
-        for frame in page.frames:
+            # Check for Cloudflare Turnstile challenge if present
+            for f in page.frames:
+                if "challenges.cloudflare.com" in f.url or "turnstile" in f.url:
+                    print("[*] Detected Cloudflare Turnstile, attempting solve...")
+                    try:
+                        frame_el = f.frame_element()
+                        box = frame_el.bounding_box()
+                        if box:
+                            page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+                            page.wait_for_timeout(3000)
+                    except Exception as e:
+                        print(f"[-] Turnstile interaction note: {e}")
+                    break
+
+            print("[*] Clicking Login button...")
+            submit_loc = page.locator('input[name*="btnSubmit"], input[value="Login"], input[type="submit"]').first
+            submit_loc.click()
+
             try:
-                frame_html = frame.content()
-                if "139" in frame_html:
-                    content += "\n" + frame_html
+                page.wait_for_load_state("domcontentloaded", timeout=30000)
             except Exception:
                 pass
+            page.wait_for_timeout(3000)
+            print(f"[*] Post-login URL: {page.url} | Title: {page.title()}")
 
-        browser.close()
-        print("[+] Timetable HTML extracted successfully.")
-        return content
+            print("[*] Navigating to Student Timetable Report...")
+            page.goto("https://ums.lpu.in/lpuums/Reports/frmStudentTimeTable.aspx", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3000)
+            print(f"[*] Timetable URL: {page.url} | Title: {page.title()}")
+
+            # Wait for timetable table
+            print("[*] Waiting for timetable grid table...")
+            try:
+                page.wait_for_selector('table[class*="139"]', timeout=30000)
+                print("[+] Located table with class containing '139'!")
+            except Exception as e:
+                print(f"[-] Timetable selector wait note: {e}")
+                page.screenshot(path="debug_error.png")
+
+            content = page.content()
+            for frame in page.frames:
+                try:
+                    frame_html = frame.content()
+                    if "139" in frame_html:
+                        content += "\n" + frame_html
+                except Exception:
+                    pass
+
+            browser.close()
+            print("[+] Timetable HTML extracted.")
+            return content
+
+        except Exception as err:
+            print(f"[!] Error during browser execution: {err}")
+            try:
+                page.screenshot(path="debug_error.png")
+            except Exception:
+                pass
+            browser.close()
+            raise err
 
 def build_ics(html, output_path="timetable.ics", num_weeks=2):
     """
@@ -182,6 +205,9 @@ def build_ics(html, output_path="timetable.ics", num_weeks=2):
 
     if not table:
         print("[!] Error: Could not locate timetable table in HTML.")
+        if os.path.exists(output_path):
+            print(f"[*] Keeping existing {output_path} file.")
+            return True
         return False
 
     cal = Calendar()

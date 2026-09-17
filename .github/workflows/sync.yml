@@ -36,6 +36,14 @@ jobs:
         run: |
           python scraper.py
 
+      - name: Upload Debug Artifacts on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: debug_*.png
+          if-no-files-found: ignore
+
       - name: Commit & Push Synced Calendar
         run: |
           git config --global user.name "github-actions[bot]"
