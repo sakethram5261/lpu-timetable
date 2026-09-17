@@ -2,7 +2,10 @@
 """
 LPU Timetable Scraper & iCalendar Sync
 Extracts student timetable from LPU UMS and builds an RFC 5545 compliant timetable.ics file.
-Supports both headless (CI/CD) and headed (interactive local desktop) execution.
+Includes:
+- 10-minute advance alerts before every single class.
+- Daily 8:00 AM Morning Briefing notification summarizing all classes for that day.
+- Support for both local HTML file parsing and live Playwright automation.
 """
 
 import os
@@ -228,6 +231,9 @@ def get_html(headed=False):
 def build_ics(html, output_path="timetable.ics", num_weeks=4):
     """
     Parses the timetable HTML table and writes an RFC 5545 compliant .ics calendar file.
+    Includes:
+    - 10-minute advance notification reminders for each class.
+    - Daily 8:00 AM Morning Briefing notification summarizing all classes for that day.
     Generates rolling events for `num_weeks` starting from the target Monday.
     """
     soup = BeautifulSoup(html, "html.parser")
@@ -265,10 +271,14 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
         base_monday = today - datetime.timedelta(days=today.weekday())
 
     events_count = 0
+    briefings_count = 0
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
     # Rolling schedule (e.g. 4 weeks coverage)
     target_mondays = [base_monday + datetime.timedelta(weeks=w) for w in range(num_weeks)]
+
+    # Collect parsed classes per day index (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat)
+    day_classes = {i: [] for i in range(6)}
 
     for tr in table.find_all("tr"):
         tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
@@ -317,36 +327,101 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
             elif type_char == "T":
                 type_name = "Tutorial"
 
-            # Generate event for each targeted week
+            class_info = {
+                "code": code,
+                "title": title,
+                "room": room,
+                "section": section,
+                "group": group,
+                "type_name": type_name,
+                "sh": sh,
+                "sm": sm,
+                "eh": eh,
+                "em": em,
+                "raw": val
+            }
+            day_classes[day_idx].append(class_info)
+
+    # Sort each day's classes chronologically
+    for day_idx in day_classes:
+        day_classes[day_idx].sort(key=lambda x: (x["sh"], x["sm"]))
+
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+    # 1. Add individual Class Events (with 10-min reminder)
+    for day_idx, classes in day_classes.items():
+        for c in classes:
             for target_mon in target_mondays:
                 event_date = target_mon + datetime.timedelta(days=day_idx)
-                dtstart = datetime.datetime.combine(event_date, datetime.time(sh, sm))
-                dtend = datetime.datetime.combine(event_date, datetime.time(eh, em))
+                dtstart = datetime.datetime.combine(event_date, datetime.time(c["sh"], c["sm"]))
+                dtend = datetime.datetime.combine(event_date, datetime.time(c["eh"], c["em"]))
 
                 ev = Event()
-                ev.add("summary", f"{code}: {title}")
-                ev.add("location", f"Room {room}, LPU")
-                ev.add("description", f"Course: {title} ({code})\nType: {type_name}\nRoom: {room}\nSection: {section}\nGroup: {group}\nRaw: {val}")
+                ev.add("summary", f"{c['code']}: {c['title']}")
+                ev.add("location", f"Room {c['room']}, LPU")
+                ev.add("description", f"Course: {c['title']} ({c['code']})\nType: {c['type_name']}\nRoom: {c['room']}\nSection: {c['section']}\nGroup: {c['group']}")
                 ev.add("dtstart", dtstart)
                 ev.add("dtend", dtend)
                 ev.add("dtstamp", now_utc)
 
-                uid = f"lpu-{code}-{event_date.strftime('%Y%m%d')}-{sh:02d}{sm:02d}@lpu-sync"
+                uid = f"lpu-{c['code']}-{event_date.strftime('%Y%m%d')}-{c['sh']:02d}{c['sm']:02d}@lpu-sync"
                 ev.add("uid", uid)
 
+                # 10-Minute Reminder Alert before class
                 alarm = Alarm()
                 alarm.add("action", "DISPLAY")
-                alarm.add("description", f"Upcoming class: {code} in Room {room}")
-                alarm.add("trigger", datetime.timedelta(minutes=-15))
+                alarm.add("description", f"⏰ Class in 10 mins: {c['code']} in Room {c['room']}")
+                alarm.add("trigger", datetime.timedelta(minutes=-10))
                 ev.add_component(alarm)
 
                 cal.add_component(ev)
                 events_count += 1
 
+    # 2. Add Daily Morning Schedule Briefing (8:00 AM notification)
+    for day_idx, classes in day_classes.items():
+        if not classes:
+            continue
+        day_name = day_names[day_idx]
+        first_c = classes[0]
+
+        summary_lines = [f"☀️ Good morning! Here is your class schedule for {day_name}:\n"]
+        for idx, c in enumerate(classes, 1):
+            time_str = f"{c['sh']:02d}:{c['sm']:02d} - {c['eh']:02d}:{c['em']:02d}"
+            summary_lines.append(f"{idx}. {time_str} | {c['code']} in Room {c['room']} ({c['type_name']}) - {c['title']}")
+
+        summary_body = "\n".join(summary_lines)
+
+        for target_mon in target_mondays:
+            event_date = target_mon + datetime.timedelta(days=day_idx)
+            # Briefing event scheduled at 08:00 AM to 08:30 AM
+            brief_start = datetime.datetime.combine(event_date, datetime.time(8, 0))
+            brief_end = datetime.datetime.combine(event_date, datetime.time(8, 30))
+
+            ev_brief = Event()
+            ev_brief.add("summary", f"📋 Today: {len(classes)} Classes (First @ {first_c['sh']:02d}:{first_c['sm']:02d} in {first_c['room']})")
+            ev_brief.add("location", "Lovely Professional University")
+            ev_brief.add("description", summary_body)
+            ev_brief.add("dtstart", brief_start)
+            ev_brief.add("dtend", brief_end)
+            ev_brief.add("dtstamp", now_utc)
+
+            uid_brief = f"lpu-briefing-{event_date.strftime('%Y%m%d')}@lpu-sync"
+            ev_brief.add("uid", uid_brief)
+
+            # 8:00 AM Alarm Notification
+            alarm_brief = Alarm()
+            alarm_brief.add("action", "DISPLAY")
+            alarm_brief.add("description", f"📋 Today's Schedule: {len(classes)} classes. First class: {first_c['code']} at {first_c['sh']:02d}:{first_c['sm']:02d} AM in Room {first_c['room']}.")
+            alarm_brief.add("trigger", datetime.timedelta(minutes=0))
+            ev_brief.add_component(alarm_brief)
+
+            cal.add_component(ev_brief)
+            briefings_count += 1
+
     with open(output_path, "wb") as f:
         f.write(cal.to_ical())
 
-    print(f"[+] Successfully wrote {events_count} class events to {output_path}")
+    print(f"[+] Successfully wrote {events_count} class events (with 10-min alerts) and {briefings_count} daily morning summary briefings to {output_path}")
     return True
 
 def push_to_github():
@@ -358,7 +433,7 @@ def push_to_github():
         subprocess.run(["git", "add", "timetable.ics"], check=True)
         res = subprocess.run(["git", "diff", "--staged", "--quiet"])
         if res.returncode != 0:
-            subprocess.run(["git", "commit", "-m", "Sync real timetable.ics with all class events"], check=True)
+            subprocess.run(["git", "commit", "-m", "Sync real timetable.ics with 10-min reminders and daily morning briefings"], check=True)
             subprocess.run(["git", "push", "origin", "main"], check=True)
             print("[+] Successfully pushed updated timetable to GitHub Pages!")
         else:
