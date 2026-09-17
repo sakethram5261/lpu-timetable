@@ -2,12 +2,14 @@
 """
 LPU Timetable Scraper & iCalendar Sync
 Extracts student timetable from LPU UMS and builds an RFC 5545 compliant timetable.ics file.
+Supports both headless (CI/CD) and headed (interactive local desktop) execution.
 """
 
 import os
 import sys
 import re
 import datetime
+import subprocess
 from bs4 import BeautifulSoup
 from icalendar import Calendar, Event, Alarm
 
@@ -64,34 +66,37 @@ def parse_slot(slot_str):
 
     return sh, sm, eh, em
 
-def get_html():
+def get_html(headed=False):
     """
     Automates login to LPU UMS and extracts the student timetable HTML using Playwright.
+    If headed=True, opens a visible browser window so user can complete Cloudflare Turnstile.
     """
     if not REG_ID or not PASSWORD:
-        print("[!] ERROR: LPU_REG_ID or LPU_PASSWORD environment variable is missing!")
-        print("[!] Please configure LPU_REG_ID and LPU_PASSWORD in your GitHub Repository Secrets:")
-        print("[!] Settings -> Secrets and variables -> Actions -> New repository secret")
+        print("\n[!] ERROR: LPU_REG_ID or LPU_PASSWORD is missing!")
+        print("[!] Please check your .env file or GitHub Secrets.\n")
         sys.exit(1)
 
     from playwright.sync_api import sync_playwright
 
-    print(f"[*] Launching Playwright browser for user ID: {REG_ID}...")
+    print(f"[*] Starting browser (headed={headed}) for User ID: {REG_ID}...")
     with sync_playwright() as p:
+        browser_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+        ]
+        if headed:
+            browser_args.append("--start-maximized")
+
         browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage"
-            ]
+            headless=not headed,
+            args=browser_args
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
+            viewport={"width": 1280, "height": 850} if not headed else None,
+            no_viewport=True if headed else False
         )
-        # Prevent automation flag detection
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         page = context.new_page()
@@ -106,82 +111,99 @@ def get_html():
         page.on("dialog", lambda dialog: dialog.accept())
 
         try:
-            print("[*] Navigating to UMS Login page...")
+            print("[*] Navigating to UMS Login page (https://ums.lpu.in/lpuums/LoginNew.aspx)...")
             page.goto("https://ums.lpu.in/lpuums/LoginNew.aspx", wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(2000)
-            print(f"[*] Loaded URL: {page.url} | Title: {page.title()}")
 
-            # Check if username input exists
+            # Pre-fill credentials
             user_loc = page.locator('input[name*="txtUserName"], #txtU, input[type="text"]').first
-            if not user_loc.is_visible():
-                print("[!] Username input not visible! Page might be under Cloudflare interstitial.")
-                page.screenshot(path="debug_error.png")
-                content = page.content()
-                browser.close()
-                return content
+            if user_loc.is_visible():
+                print("[*] Entering User ID...")
+                user_loc.fill(REG_ID)
 
-            print("[*] Entering username...")
-            user_loc.fill(REG_ID)
-
-            # Check if password input exists
             pwd_loc = page.locator('input[name*="txtPassword"], input[type="password"]').first
-            print("[*] Entering password...")
-            pwd_loc.fill(PASSWORD)
+            if pwd_loc.is_visible():
+                print("[*] Entering Password...")
+                pwd_loc.fill(PASSWORD)
 
-            # Check for Cloudflare Turnstile challenge if present
-            for f in page.frames:
-                if "challenges.cloudflare.com" in f.url or "turnstile" in f.url:
-                    print("[*] Detected Cloudflare Turnstile, attempting solve...")
-                    try:
-                        frame_el = f.frame_element()
-                        box = frame_el.bounding_box()
-                        if box:
-                            page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
-                            page.wait_for_timeout(3000)
-                    except Exception as e:
-                        print(f"[-] Turnstile interaction note: {e}")
-                    break
+            if headed:
+                print("\n" + "="*65)
+                print("[*] BROWSER WINDOW IS OPEN ON YOUR SCREEN!")
+                print("[*] If Cloudflare Turnstile ('Verify you are human') appears:")
+                print("    👉 Simply click the checkbox in the browser window.")
+                print("[*] If credentials are filled, click the orange 'Login' button.")
+                print("="*65 + "\n")
 
-            print("[*] Clicking Login button...")
-            submit_loc = page.locator('input[name*="btnSubmit"], input[value="Login"], input[type="submit"]').first
-            submit_loc.click()
+                # In headed mode, wait for user or auto-login to leave LoginNew.aspx
+                print("[*] Waiting for login to complete (up to 90 seconds)...")
+                logged_in = False
+                for _ in range(90):
+                    page.wait_for_timeout(1000)
+                    cur_url = page.url.lower()
+                    if "loginnew.aspx" not in cur_url and "lpuums" in cur_url:
+                        print(f"[+] Login detected! Redirected to: {page.url}")
+                        logged_in = True
+                        break
+                    # If still on login page and login button is visible, try auto-click if turnstile cleared
+                    token = page.locator("[name*='cf-turnstile-response']").first.input_value() if page.locator("[name*='cf-turnstile-response']").count() > 0 else ""
+                    if token and len(token) > 20:
+                        btn = page.locator('input[name*="btnSubmit"], input[value="Login"]').first
+                        if btn.is_visible():
+                            print("[*] Turnstile verified! Auto-clicking Login button...")
+                            btn.click()
+                
+                if not logged_in and "loginnew.aspx" in page.url.lower():
+                    print("[-] Timed out waiting for login. Continuing attempt to navigate to report...")
+            else:
+                # Headless automated flow
+                for f in page.frames:
+                    if "challenges.cloudflare.com" in f.url or "turnstile" in f.url:
+                        try:
+                            box = f.frame_element().bounding_box()
+                            if box:
+                                page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+                                page.wait_for_timeout(3000)
+                        except Exception:
+                            pass
+                        break
 
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=30000)
-            except Exception:
-                pass
-            page.wait_for_timeout(3000)
-            print(f"[*] Post-login URL: {page.url} | Title: {page.title()}")
+                submit_loc = page.locator('input[name*="btnSubmit"], input[value="Login"], input[type="submit"]').first
+                if submit_loc.is_visible():
+                    submit_loc.click()
+                    page.wait_for_timeout(3000)
 
-            print("[*] Navigating to Student Timetable Report...")
+            # Navigate directly to Student Timetable Report
+            print("[*] Opening Student Timetable Report (frmStudentTimeTable.aspx)...")
             page.goto("https://ums.lpu.in/lpuums/Reports/frmStudentTimeTable.aspx", wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(3000)
-            print(f"[*] Timetable URL: {page.url} | Title: {page.title()}")
 
-            # Wait for timetable table
             print("[*] Waiting for timetable grid table...")
             try:
                 page.wait_for_selector('table[class*="139"]', timeout=30000)
-                print("[+] Located table with class containing '139'!")
+                print("[+] Located official timetable table!")
             except Exception as e:
-                print(f"[-] Timetable selector wait note: {e}")
+                print(f"[-] Selector notice: {e}")
                 page.screenshot(path="debug_error.png")
 
             content = page.content()
             for frame in page.frames:
                 try:
-                    frame_html = frame.content()
-                    if "139" in frame_html:
-                        content += "\n" + frame_html
+                    f_html = frame.content()
+                    if "139" in f_html:
+                        content += "\n" + f_html
                 except Exception:
                     pass
 
+            # Save local HTML copy as backup
+            with open("timetable.html", "w", encoding="utf-8") as f:
+                f.write(content)
+            print("[+] Saved raw timetable backup to timetable.html")
+
             browser.close()
-            print("[+] Timetable HTML extracted.")
             return content
 
         except Exception as err:
-            print(f"[!] Error during browser execution: {err}")
+            print(f"[!] Browser error: {err}")
             try:
                 page.screenshot(path="debug_error.png")
             except Exception:
@@ -189,7 +211,7 @@ def get_html():
             browser.close()
             raise err
 
-def build_ics(html, output_path="timetable.ics", num_weeks=2):
+def build_ics(html, output_path="timetable.ics", num_weeks=4):
     """
     Parses the timetable HTML table and writes an RFC 5545 compliant .ics calendar file.
     Generates rolling events for `num_weeks` starting from the target Monday.
@@ -197,7 +219,7 @@ def build_ics(html, output_path="timetable.ics", num_weeks=2):
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_=lambda c: c and "139" in c)
     if not table:
-        # Fallback: search for any table containing slot-like text
+        # Fallback: search for any table containing time slots
         for tbl in soup.find_all("table"):
             if tbl.find(string=re.compile(r"\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}")):
                 table = tbl
@@ -219,7 +241,6 @@ def build_ics(html, output_path="timetable.ics", num_weeks=2):
     cal.add("x-wr-timezone", "Asia/Kolkata")
 
     today = datetime.date.today()
-    # If today is Saturday (5) or Sunday (6), set target Monday to upcoming Monday
     if today.weekday() in (5, 6):
         base_monday = today + datetime.timedelta(days=(7 - today.weekday()))
     else:
@@ -228,7 +249,7 @@ def build_ics(html, output_path="timetable.ics", num_weeks=2):
     events_count = 0
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
-    # Rolling schedule (current week and next week)
+    # Rolling schedule (e.g. 4 weeks coverage)
     target_mondays = [base_monday + datetime.timedelta(weeks=w) for w in range(num_weeks)]
 
     for tr in table.find_all("tr"):
@@ -261,7 +282,6 @@ def build_ics(html, output_path="timetable.ics", num_weeks=2):
             group = g_m.group(1) if g_m else "N/A"
             title = COURSES.get(code, code)
 
-            # Determine Class Type (Lecture, Practical, Tutorial)
             type_char = val.split()[0].upper() if val else ""
             type_name = "Class"
             if type_char == "L":
@@ -285,11 +305,9 @@ def build_ics(html, output_path="timetable.ics", num_weeks=2):
                 ev.add("dtend", dtend)
                 ev.add("dtstamp", now_utc)
 
-                # Deterministic UID for Apple/Google Calendar cleanly deduplicating updates
                 uid = f"lpu-{code}-{event_date.strftime('%Y%m%d')}-{sh:02d}{sm:02d}@lpu-sync"
                 ev.add("uid", uid)
 
-                # 15-minute reminder alert
                 alarm = Alarm()
                 alarm.add("action", "DISPLAY")
                 alarm.add("description", f"Upcoming class: {code} in Room {room}")
@@ -302,26 +320,54 @@ def build_ics(html, output_path="timetable.ics", num_weeks=2):
     with open(output_path, "wb") as f:
         f.write(cal.to_ical())
 
-    print(f"[+] Successfully wrote {events_count} events to {output_path}")
+    print(f"[+] Successfully wrote {events_count} class events to {output_path}")
     return True
 
-if __name__ == "__main__":
-    html_content = None
+def push_to_github():
+    """
+    Commits timetable.ics and pushes to GitHub Pages branch.
+    """
+    try:
+        print("[*] Pushing updated timetable.ics to GitHub...")
+        subprocess.run(["git", "add", "timetable.ics"], check=True)
+        # Check if there are staged changes
+        res = subprocess.run(["git", "diff", "--staged", "--quiet"])
+        if res.returncode != 0:
+            subprocess.run(["git", "commit", "-m", "Sync timetable.ics from local run"], check=True)
+            subprocess.run(["git", "push", "origin", "main"], check=True)
+            print("[+] Successfully pushed updated timetable to GitHub Pages!")
+        else:
+            print("[*] timetable.ics is already up-to-date on GitHub.")
+    except Exception as e:
+        print(f"[-] Git push notice: {e}")
 
-    # Check if a local HTML file was supplied for testing
-    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-        print(f"[*] Reading HTML from local file: {sys.argv[1]}")
-        with open(sys.argv[1], "r", encoding="utf-8") as f:
+if __name__ == "__main__":
+    is_headed = "--headed" in sys.argv or os.environ.get("HEADED", "").lower() in ("true", "1")
+    do_push = "--push" in sys.argv or os.environ.get("AUTO_PUSH", "").lower() in ("true", "1")
+
+    # If an HTML file path is supplied directly as an argument
+    html_file_arg = None
+    for arg in sys.argv[1:]:
+        if arg.endswith(".html") and os.path.exists(arg):
+            html_file_arg = arg
+            break
+
+    html_content = None
+    if html_file_arg:
+        print(f"[*] Reading timetable HTML from local file: {html_file_arg}")
+        with open(html_file_arg, "r", encoding="utf-8") as f:
             html_content = f.read()
     elif os.environ.get("HTML_FILE") and os.path.exists(os.environ["HTML_FILE"]):
-        print(f"[*] Reading HTML from environment HTML_FILE: {os.environ['HTML_FILE']}")
+        print(f"[*] Reading timetable HTML from environment HTML_FILE: {os.environ['HTML_FILE']}")
         with open(os.environ["HTML_FILE"], "r", encoding="utf-8") as f:
             html_content = f.read()
     else:
-        html_content = get_html()
+        html_content = get_html(headed=is_headed)
 
     if html_content:
-        build_ics(html_content)
+        success = build_ics(html_content, "timetable.ics")
+        if success and do_push:
+            push_to_github()
     else:
-        print("[!] No HTML content available.")
+        print("[!] Error: No HTML content extracted.")
         sys.exit(1)
