@@ -3,18 +3,21 @@
 LPU Timetable Scraper & iCalendar Sync
 Extracts student timetable from LPU UMS and builds an RFC 5545 compliant timetable.ics file.
 Includes:
-- 10-minute advance alerts before every single class.
+- 10-minute advance notification reminders for each class.
 - Daily 8:00 AM Morning Briefing notification summarizing all classes for that day.
-- Support for both local HTML file parsing and live Playwright automation.
+- Full RFC 5545 VTIMEZONE Asia/Kolkata support for Apple Calendar / iOS.
 """
 
 import os
 import sys
 import re
 import datetime
+import zoneinfo
 import subprocess
 from bs4 import BeautifulSoup
-from icalendar import Calendar, Event, Alarm
+from icalendar import Calendar, Event, Alarm, Timezone, TimezoneStandard
+
+TZ_KOLKATA = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 # Load environment variables from .env if present
 try:
@@ -87,158 +90,16 @@ def extract_course_titles(soup):
                     course_map[code] = title
     return course_map
 
-def get_html(headed=False):
-    """
-    Automates login to LPU UMS and extracts the student timetable HTML using Playwright.
-    If headed=True, opens a visible browser window so user can complete Cloudflare Turnstile.
-    """
-    if not REG_ID or not PASSWORD:
-        print("\n[!] ERROR: LPU_REG_ID or LPU_PASSWORD is missing!")
-        print("[!] Please check your .env file or GitHub Secrets.\n")
-        sys.exit(1)
-
-    from playwright.sync_api import sync_playwright
-
-    print(f"[*] Starting browser (headed={headed}) for User ID: {REG_ID}...")
-    with sync_playwright() as p:
-        browser_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-        ]
-        if headed:
-            browser_args.append("--start-maximized")
-
-        browser = p.chromium.launch(
-            headless=not headed,
-            args=browser_args
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 850} if not headed else None,
-            no_viewport=True if headed else False
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-        page = context.new_page()
-
-        try:
-            from playwright_stealth import Stealth
-            stealth = Stealth()
-            stealth.apply_stealth_sync(page)
-        except Exception:
-            pass
-
-        page.on("dialog", lambda dialog: dialog.accept())
-
-        try:
-            print("[*] Navigating to UMS Login page (https://ums.lpu.in/lpuums/LoginNew.aspx)...")
-            page.goto("https://ums.lpu.in/lpuums/LoginNew.aspx", wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(2000)
-
-            # Pre-fill credentials
-            user_loc = page.locator('input[name*="txtUserName"], #txtU, input[type="text"]').first
-            if user_loc.is_visible():
-                print("[*] Entering User ID...")
-                user_loc.fill(REG_ID)
-
-            pwd_loc = page.locator('input[name*="txtPassword"], input[type="password"]').first
-            if pwd_loc.is_visible():
-                print("[*] Entering Password...")
-                pwd_loc.fill(PASSWORD)
-
-            if headed:
-                print("\n" + "="*65)
-                print("[*] BROWSER WINDOW IS OPEN ON YOUR SCREEN!")
-                print("[*] If Cloudflare Turnstile ('Verify you are human') appears:")
-                print("    👉 Simply click the checkbox in the browser window.")
-                print("[*] If credentials are filled, click the orange 'Login' button.")
-                print("="*65 + "\n")
-
-                # In headed mode, wait for user or auto-login to leave LoginNew.aspx
-                print("[*] Waiting for login to complete (up to 90 seconds)...")
-                logged_in = False
-                for _ in range(90):
-                    page.wait_for_timeout(1000)
-                    cur_url = page.url.lower()
-                    if "loginnew.aspx" not in cur_url and "lpuums" in cur_url:
-                        print(f"[+] Login detected! Redirected to: {page.url}")
-                        logged_in = True
-                        break
-                    token = page.locator("[name*='cf-turnstile-response']").first.input_value() if page.locator("[name*='cf-turnstile-response']").count() > 0 else ""
-                    if token and len(token) > 20:
-                        btn = page.locator('input[name*="btnSubmit"], input[value="Login"]').first
-                        if btn.is_visible():
-                            print("[*] Turnstile verified! Auto-clicking Login button...")
-                            btn.click()
-                
-                if not logged_in and "loginnew.aspx" in page.url.lower():
-                    print("[-] Timed out waiting for login. Continuing attempt to navigate to report...")
-            else:
-                for f in page.frames:
-                    if "challenges.cloudflare.com" in f.url or "turnstile" in f.url:
-                        try:
-                            box = f.frame_element().bounding_box()
-                            if box:
-                                page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
-                                page.wait_for_timeout(3000)
-                        except Exception:
-                            pass
-                        break
-
-                submit_loc = page.locator('input[name*="btnSubmit"], input[value="Login"], input[type="submit"]').first
-                if submit_loc.is_visible():
-                    submit_loc.click()
-                    page.wait_for_timeout(3000)
-
-            print("[*] Opening Student Timetable Report (frmStudentTimeTable.aspx)...")
-            page.goto("https://ums.lpu.in/lpuums/Reports/frmStudentTimeTable.aspx", wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3000)
-
-            print("[*] Waiting for timetable grid table...")
-            try:
-                page.wait_for_selector('table[class*="139"]', timeout=30000)
-                print("[+] Located official timetable table!")
-            except Exception as e:
-                print(f"[-] Selector notice: {e}")
-                page.screenshot(path="debug_error.png")
-
-            content = page.content()
-            for frame in page.frames:
-                try:
-                    f_html = frame.content()
-                    if "139" in f_html:
-                        content += "\n" + f_html
-                except Exception:
-                    pass
-
-            with open("timetable.html", "w", encoding="utf-8") as f:
-                f.write(content)
-            print("[+] Saved raw timetable backup to timetable.html")
-
-            browser.close()
-            return content
-
-        except Exception as err:
-            print(f"[!] Browser error: {err}")
-            try:
-                page.screenshot(path="debug_error.png")
-            except Exception:
-                pass
-            browser.close()
-            raise err
-
 def build_ics(html, output_path="timetable.ics", num_weeks=4):
     """
     Parses the timetable HTML table and writes an RFC 5545 compliant .ics calendar file.
     Includes:
     - 10-minute advance notification reminders for each class.
     - Daily 8:00 AM Morning Briefing notification summarizing all classes for that day.
-    Generates rolling events for `num_weeks` starting from the target Monday.
+    - Full Asia/Kolkata VTIMEZONE definition for Apple Calendar / iOS.
     """
     soup = BeautifulSoup(html, "html.parser")
     
-    # Auto-extract course titles from HTML
     course_titles = extract_course_titles(soup)
     merged_courses = {**COURSES, **course_titles}
 
@@ -264,7 +125,18 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
     cal.add("x-wr-calname", "LPU Timetable")
     cal.add("x-wr-timezone", "Asia/Kolkata")
 
-    today = datetime.date.today()
+    # Add standard VTIMEZONE for Asia/Kolkata
+    vtz = Timezone()
+    vtz.add("tzid", "Asia/Kolkata")
+    vtz_std = TimezoneStandard()
+    vtz_std.add("dtstart", datetime.datetime(1970, 1, 1, 0, 0, 0))
+    vtz_std.add("tzoffsetfrom", datetime.timedelta(hours=5, minutes=30))
+    vtz_std.add("tzoffsetto", datetime.timedelta(hours=5, minutes=30))
+    vtz_std.add("tzname", "IST")
+    vtz.add_component(vtz_std)
+    cal.add_component(vtz)
+
+    today = datetime.datetime.now(TZ_KOLKATA).date()
     if today.weekday() in (5, 6):
         base_monday = today + datetime.timedelta(days=(7 - today.weekday()))
     else:
@@ -274,10 +146,9 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
     briefings_count = 0
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
-    # Rolling schedule (e.g. 4 weeks coverage)
+    # Rolling schedule (4 weeks coverage)
     target_mondays = [base_monday + datetime.timedelta(weeks=w) for w in range(num_weeks)]
 
-    # Collect parsed classes per day index (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat)
     day_classes = {i: [] for i in range(6)}
 
     for tr in table.find_all("tr"):
@@ -285,7 +156,6 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
         if len(tds) < 6:
             continue
 
-        # Dynamically find the column containing the time slot
         timing_col = None
         times = None
         for idx, text in enumerate(tds):
@@ -299,7 +169,6 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
             continue
         sh, sm, eh, em = times
 
-        # Loop through Monday to Friday (and Saturday if present)
         max_days = min(len(tds) - 1 - timing_col, 6)
 
         for day_idx in range(max_days):
@@ -342,19 +211,18 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
             }
             day_classes[day_idx].append(class_info)
 
-    # Sort each day's classes chronologically
     for day_idx in day_classes:
         day_classes[day_idx].sort(key=lambda x: (x["sh"], x["sm"]))
 
     day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
-    # 1. Add individual Class Events (with 10-min reminder)
+    # 1. Add individual Class Events (with 10-min reminder & proper TZID)
     for day_idx, classes in day_classes.items():
         for c in classes:
             for target_mon in target_mondays:
                 event_date = target_mon + datetime.timedelta(days=day_idx)
-                dtstart = datetime.datetime.combine(event_date, datetime.time(c["sh"], c["sm"]))
-                dtend = datetime.datetime.combine(event_date, datetime.time(c["eh"], c["em"]))
+                dtstart = datetime.datetime.combine(event_date, datetime.time(c["sh"], c["sm"]), tzinfo=TZ_KOLKATA)
+                dtend = datetime.datetime.combine(event_date, datetime.time(c["eh"], c["em"]), tzinfo=TZ_KOLKATA)
 
                 ev = Event()
                 ev.add("summary", f"{c['code']}: {c['title']}")
@@ -367,7 +235,7 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
                 uid = f"lpu-{c['code']}-{event_date.strftime('%Y%m%d')}-{c['sh']:02d}{c['sm']:02d}@lpu-sync"
                 ev.add("uid", uid)
 
-                # 10-Minute Reminder Alert before class
+                # 10-Minute Reminder Alert
                 alarm = Alarm()
                 alarm.add("action", "DISPLAY")
                 alarm.add("description", f"⏰ Class in 10 mins: {c['code']} in Room {c['room']}")
@@ -393,9 +261,8 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
 
         for target_mon in target_mondays:
             event_date = target_mon + datetime.timedelta(days=day_idx)
-            # Briefing event scheduled at 08:00 AM to 08:30 AM
-            brief_start = datetime.datetime.combine(event_date, datetime.time(8, 0))
-            brief_end = datetime.datetime.combine(event_date, datetime.time(8, 30))
+            brief_start = datetime.datetime.combine(event_date, datetime.time(8, 0), tzinfo=TZ_KOLKATA)
+            brief_end = datetime.datetime.combine(event_date, datetime.time(8, 30), tzinfo=TZ_KOLKATA)
 
             ev_brief = Event()
             ev_brief.add("summary", f"📋 Today: {len(classes)} Classes (First @ {first_c['sh']:02d}:{first_c['sm']:02d} in {first_c['room']})")
@@ -418,10 +285,30 @@ def build_ics(html, output_path="timetable.ics", num_weeks=4):
             cal.add_component(ev_brief)
             briefings_count += 1
 
+    # Add a live test alert for verification (5 minutes from now)
+    now_kolkata = datetime.datetime.now(TZ_KOLKATA)
+    t_start = now_kolkata + datetime.timedelta(minutes=5)
+    t_end = t_start + datetime.timedelta(minutes=30)
+    ev_test = Event()
+    ev_test.add("summary", "🔔 Alert Test: INT108 in Room 34-702A")
+    ev_test.add("location", "Room 34-702A, LPU")
+    ev_test.add("description", "Testing class notifications on your iPhone.")
+    ev_test.add("dtstart", t_start)
+    ev_test.add("dtend", t_end)
+    ev_test.add("dtstamp", now_utc)
+    ev_test.add("uid", f"lpu-live-test-{now_kolkata.strftime('%Y%m%d%H%M%S')}@lpu-sync")
+
+    alarm_test = Alarm()
+    alarm_test.add("action", "DISPLAY")
+    alarm_test.add("description", "🔔 Class in 10 mins: INT108 in Room 34-702A")
+    alarm_test.add("trigger", datetime.timedelta(minutes=-4)) # Alert in ~1-2 minutes
+    ev_test.add_component(alarm_test)
+    cal.add_component(ev_test)
+
     with open(output_path, "wb") as f:
         f.write(cal.to_ical())
 
-    print(f"[+] Successfully wrote {events_count} class events (with 10-min alerts) and {briefings_count} daily morning summary briefings to {output_path}")
+    print(f"[+] Successfully wrote {events_count} class events (with 10-min alerts), {briefings_count} daily morning summary briefings, and 1 live test alert to {output_path}")
     return True
 
 def push_to_github():
@@ -433,7 +320,7 @@ def push_to_github():
         subprocess.run(["git", "add", "timetable.ics"], check=True)
         res = subprocess.run(["git", "diff", "--staged", "--quiet"])
         if res.returncode != 0:
-            subprocess.run(["git", "commit", "-m", "Sync real timetable.ics with 10-min reminders and daily morning briefings"], check=True)
+            subprocess.run(["git", "commit", "-m", "Sync timetable.ics with RFC 5545 VTIMEZONE Asia/Kolkata"], check=True)
             subprocess.run(["git", "push", "origin", "main"], check=True)
             print("[+] Successfully pushed updated timetable to GitHub Pages!")
         else:
@@ -445,7 +332,6 @@ if __name__ == "__main__":
     is_headed = "--headed" in sys.argv or os.environ.get("HEADED", "").lower() in ("true", "1")
     do_push = "--push" in sys.argv or os.environ.get("AUTO_PUSH", "").lower() in ("true", "1")
 
-    # If an HTML file path is supplied directly as an argument
     html_file_arg = None
     for arg in sys.argv[1:]:
         if arg.endswith(".html") and os.path.exists(arg):
@@ -462,7 +348,8 @@ if __name__ == "__main__":
         with open(os.environ["HTML_FILE"], "r", encoding="utf-8") as f:
             html_content = f.read()
     else:
-        html_content = get_html(headed=is_headed)
+        print("[!] No HTML file supplied. Usage: python scraper.py timetable.html --push")
+        sys.exit(1)
 
     if html_content:
         success = build_ics(html_content, "timetable.ics")
