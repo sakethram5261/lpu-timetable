@@ -69,18 +69,23 @@ class TestScraper(unittest.TestCase):
             with open(out_file, "rb") as f:
                 cal = Calendar.from_ical(f.read())
 
-            events = [c for c in cal.walk() if c.name == "VEVENT"]
-            # 6 active classes across 2 weeks = 12 events
-            self.assertEqual(len(events), 12)
+            all_events = [c for c in cal.walk() if c.name == "VEVENT"]
+            class_events = [ev for ev in all_events if "Today:" not in str(ev.get("summary"))]
+            brief_events = [ev for ev in all_events if "Today:" in str(ev.get("summary"))]
 
-            for ev in events:
+            # 6 active classes across 2 weeks = 12 class events
+            self.assertEqual(len(class_events), 12)
+            # 5 active days across 2 weeks = 10 morning briefings
+            self.assertEqual(len(brief_events), 10)
+
+            for ev in class_events:
                 self.assertIn("Room", str(ev.get("location")))
                 self.assertIsNotNone(ev.get("uid"))
                 self.assertIsNotNone(ev.get("dtstamp"))
                 self.assertIsNotNone(ev.get("dtstart"))
                 self.assertIsNotNone(ev.get("dtend"))
 
-                # Check 15-minute alarm
+                # Check 10-minute alarm
                 alarms = [a for a in ev.walk() if a.name == "VALARM"]
                 self.assertEqual(len(alarms), 1)
                 self.assertEqual(alarms[0].get("action"), "DISPLAY")
